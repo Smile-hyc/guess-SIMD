@@ -87,11 +87,23 @@ int main()
         if (curr_num > 1000000)
         {
             auto start_hash = system_clock::now();
+
+            string simd_inputs[4];
+            bit32 simd_states[4][4];
+            int simd_count = 0;
+
             bit32 state[4];
             for (string pw : q.guesses)
             {
                 // TODO：对于SIMD实验，将这里替换成你的SIMD MD5函数
-                MD5Hash(pw, state);
+                simd_inputs[simd_count] = pw;
+                simd_count++;
+
+                if (simd_count == 4)
+                {
+                    MD5Hash_SIMD4(simd_inputs, simd_states);
+                    simd_count = 0;
+                }
 
                 // 以下注释部分用于输出猜测和哈希，但是由于自动测试系统不太能写文件，所以这里你可以改成cout
                 // a<<pw<<"\t";
@@ -100,6 +112,12 @@ int main()
                 //     a << std::setw(8) << std::setfill('0') << hex << state[i1];
                 // }
                 // a << endl;
+            }
+
+            // q.guesses中的数量不一定正好是4的倍数，剩余不足4个的口令仍然使用串行MD5处理
+            for (int i = 0; i < simd_count; i++)
+            {
+                MD5Hash(simd_inputs[i], state);
             }
 
             // 在这里对哈希所需的总时长进行计算

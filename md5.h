@@ -1,3 +1,6 @@
+#ifndef MD5_H
+#define MD5_H
+
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -79,4 +82,9 @@ typedef unsigned int bit32;
   (a) += (b); \
 }
 
-void MD5Hash(string input, bit32 *state);
+void MD5Hash(const string &input, bit32 *state);
+
+// NEON SIMD 四路并行 MD5
+void MD5Hash_SIMD4(const string inputs[4], bit32 states[4][4]);
+
+#endif
