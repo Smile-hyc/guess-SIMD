@@ -4,6 +4,7 @@
 #include <sstream>
 #include "md5.h"
 #include <iomanip>
+#include <cstdlib>
 using namespace std;
 using namespace chrono;
 
@@ -12,7 +13,7 @@ using namespace chrono;
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O1
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
 
-int main()
+int main(int argc, char* argv[])
 {
     //下面代码用于测试MD5哈希的正确性
     cout << "Testing MD5Hash correctness..." << endl;
@@ -46,6 +47,31 @@ int main()
     double time_guess = 0; // 哈希和猜测的总时长
     double time_train = 0; // 模型训练的总时长
     PriorityQueue q;
+
+    // Pthread 动态线程版本参数设置
+    // argv[1]：线程数，例如 ./main_pthread 4
+    // argv[2]：并行阈值，例如 ./main_pthread 4 1000
+    if (argc >= 2)
+    {
+        q.pthread_thread_num = atoi(argv[1]);
+        if (q.pthread_thread_num < 1)
+        {
+            q.pthread_thread_num = 1;
+        }
+    }
+
+    if (argc >= 3)
+    {
+        q.pthread_threshold = atoi(argv[2]);
+        if (q.pthread_threshold < 0)
+        {
+            q.pthread_threshold = 0;
+        }
+    }
+
+    cout << "Pthread threads: " << q.pthread_thread_num << endl;
+    cout << "Pthread threshold: " << q.pthread_threshold << endl;
+
     auto start_train = system_clock::now();
     q.m.train("/guessdata/Rockyou-singleLined-full.txt");
     q.m.order();

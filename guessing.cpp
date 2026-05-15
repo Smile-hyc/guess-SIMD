@@ -176,6 +176,53 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
+// Pthread 工作函数：处理 ordered_values 的一个连续区间
+// 每个线程只写自己的 local_guesses，不直接写全局 guesses
+static void* process_segment_range(void* arg)
+{
+    ThreadGenerateArgs* args = static_cast<ThreadGenerateArgs*>(arg);
+
+    if (args == nullptr || args->segment_data == nullptr)
+    {
+        return nullptr;
+    }
+
+    args->local_guesses.clear();
+    args->local_count = 0;
+
+    int actual_size = args->segment_data->ordered_values.size();
+
+    int start = args->start_index;
+    int end = args->end_index;
+
+    if (start < 0)
+    {
+        start = 0;
+    }
+
+    if (end > actual_size)
+    {
+        end = actual_size;
+    }
+
+    if (start >= end)
+    {
+        return nullptr;
+    }
+
+    args->local_guesses.reserve(end - start);
+
+    for (int i = start; i < end; i++)
+    {
+        args->local_guesses.emplace_back(
+            args->prefix + args->segment_data->ordered_values[i]
+        );
+    }
+
+    args->local_count = args->local_guesses.size();
+
+    return nullptr;
+}
 
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
@@ -207,12 +254,80 @@ void PriorityQueue::Generate(PT pt)
         // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[0]; i += 1)
+
+        // Pthread 动态线程版本：先判断任务规模，小任务仍然走串行
+        int loop_bound = pt.max_indices[0];
+        int actual_size = a->ordered_values.size();
+
+        if (loop_bound > actual_size)
         {
-            string guess = a->ordered_values[i];
-            // cout << guess << endl;
-            guesses.emplace_back(guess);
-            total_guesses += 1;
+            loop_bound = actual_size;
+        }
+
+        if (loop_bound < pthread_threshold || pthread_thread_num <= 1)
+        {
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                string guess = a->ordered_values[i];
+                // cout << guess << endl;
+                guesses.emplace_back(guess);
+                total_guesses += 1;
+            }
+        }
+        else
+        {
+            int thread_num = pthread_thread_num;
+
+            if (thread_num < 1)
+            {
+                thread_num = 1;
+            }
+
+            if (loop_bound < thread_num)
+            {
+                thread_num = loop_bound;
+            }
+
+            vector<pthread_t> threads(thread_num);
+            vector<ThreadGenerateArgs> thread_args(thread_num);
+
+            int base = loop_bound / thread_num;
+            int remain = loop_bound % thread_num;
+            int current_start = 0;
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                int current_count = base;
+                if (t < remain)
+                {
+                    current_count += 1;
+                }
+
+                thread_args[t].start_index = current_start;
+                thread_args[t].end_index = current_start + current_count;
+                thread_args[t].segment_data = a;
+                thread_args[t].prefix = "";
+
+                pthread_create(&threads[t], nullptr, process_segment_range, &thread_args[t]);
+
+                current_start += current_count;
+            }
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                pthread_join(threads[t], nullptr);
+            }
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                guesses.insert(
+                    guesses.end(),
+                    thread_args[t].local_guesses.begin(),
+                    thread_args[t].local_guesses.end()
+                );
+
+                total_guesses += thread_args[t].local_count;
+            }
         }
     }
     else
@@ -262,12 +377,81 @@ void PriorityQueue::Generate(PT pt)
         // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
+
+        // Pthread 动态线程版本：先判断任务规模，小任务仍然走串行
+        int last_idx = pt.content.size() - 1;
+        int loop_bound = pt.max_indices[last_idx];
+        int actual_size = a->ordered_values.size();
+
+        if (loop_bound > actual_size)
         {
-            string temp = guess + a->ordered_values[i];
-            // cout << temp << endl;
-            guesses.emplace_back(temp);
-            total_guesses += 1;
+            loop_bound = actual_size;
+        }
+
+        if (loop_bound < pthread_threshold || pthread_thread_num <= 1)
+        {
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                string temp = guess + a->ordered_values[i];
+                // cout << temp << endl;
+                guesses.emplace_back(temp);
+                total_guesses += 1;
+            }
+        }
+        else
+        {
+            int thread_num = pthread_thread_num;
+
+            if (thread_num < 1)
+            {
+                thread_num = 1;
+            }
+
+            if (loop_bound < thread_num)
+            {
+                thread_num = loop_bound;
+            }
+
+            vector<pthread_t> threads(thread_num);
+            vector<ThreadGenerateArgs> thread_args(thread_num);
+
+            int base = loop_bound / thread_num;
+            int remain = loop_bound % thread_num;
+            int current_start = 0;
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                int current_count = base;
+                if (t < remain)
+                {
+                    current_count += 1;
+                }
+
+                thread_args[t].start_index = current_start;
+                thread_args[t].end_index = current_start + current_count;
+                thread_args[t].segment_data = a;
+                thread_args[t].prefix = guess;
+
+                pthread_create(&threads[t], nullptr, process_segment_range, &thread_args[t]);
+
+                current_start += current_count;
+            }
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                pthread_join(threads[t], nullptr);
+            }
+
+            for (int t = 0; t < thread_num; t++)
+            {
+                guesses.insert(
+                    guesses.end(),
+                    thread_args[t].local_guesses.begin(),
+                    thread_args[t].local_guesses.end()
+                );
+
+                total_guesses += thread_args[t].local_count;
+            }
         }
     }
 }

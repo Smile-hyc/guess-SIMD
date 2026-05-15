@@ -2,6 +2,8 @@
 #include <iostream>
 #include <unordered_map>
 #include <queue>
+#include <vector>
+#include <pthread.h>
 #include <omp.h>
 // #include <chrono>   
 // using namespace chrono;
@@ -135,11 +137,28 @@ public:
     void print();
 };
 
+// Pthread 生成任务参数
+// 每个线程拿到一个 ThreadGenerateArgs，就知道自己要处理哪一段 ordered_values
+struct ThreadGenerateArgs
+{
+    int start_index;              // 当前线程处理的起始下标
+    int end_index;                // 当前线程处理的结束下标，左闭右开
+    segment* segment_data;        // 指向最后一个 segment 对应的模型数据
+    string prefix;                // 多 segment 情况下的前缀；单 segment 时为空字符串
+
+    vector<string> local_guesses; // 当前线程自己的结果缓存
+    int local_count = 0;          // 当前线程生成的口令数量
+};
+
 // 优先队列，用于按照概率降序生成口令猜测
 // 实际上，这个class负责队列维护、口令生成、结果存储的全部过程
 class PriorityQueue
 {
 public:
+    // Pthread 动态线程版本参数
+    int pthread_thread_num = 4;      // 默认使用 4 个线程
+    int pthread_threshold = 1000;    // 小于该规模时走串行
+
     // 用vector实现的priority queue
     vector<PT> priority;
 
