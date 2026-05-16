@@ -48,9 +48,8 @@ int main(int argc, char* argv[])
     double time_train = 0; // 模型训练的总时长
     PriorityQueue q;
 
-    // Pthread 动态线程版本参数设置
-    // argv[1]：线程数，例如 ./main_pthread 4
-    // argv[2]：并行阈值，例如 ./main_pthread 4 1000
+    // argv[1]：线程数，例如 ./main_pthread_static 4
+    // argv[2]：并行阈值，例如 ./main_pthread_static 4 1000
     if (argc >= 2)
     {
         q.pthread_thread_num = atoi(argv[1]);
@@ -69,7 +68,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    cout << "Pthread threads: " << q.pthread_thread_num << endl;
+    cout << "Pthread static threads: " << q.pthread_thread_num << endl;
     cout << "Pthread threshold: " << q.pthread_threshold << endl;
 
     auto start_train = system_clock::now();
@@ -80,6 +79,10 @@ int main(int argc, char* argv[])
     time_train = double(duration_train.count()) * microseconds::period::num / microseconds::period::den;
 
     q.init();
+
+    // 静态线程池：训练和初始化完成后创建，后续 Generate 只投递任务
+    q.init_thread_pool(q.pthread_thread_num);
+
     cout << "here" << endl;
     int curr_num = 0;
     auto start = system_clock::now();
@@ -92,12 +95,12 @@ int main(int argc, char* argv[])
         q.total_guesses = q.guesses.size();
         if (q.total_guesses - curr_num >= 100000)
         {
-            cout << "Guesses generated: " <<history + q.total_guesses << endl;
+            cout << "Guesses generated: " << history + q.total_guesses << endl;
             curr_num = q.total_guesses;
 
             // 在此处更改实验生成的猜测上限
-            int generate_n=10000000;
-            if (history + q.total_guesses > 10000000)
+            int generate_n = 10000000;
+            if (history + q.total_guesses > generate_n)
             {
                 auto end = system_clock::now();
                 auto duration = duration_cast<microseconds>(end - start);
@@ -108,28 +111,17 @@ int main(int argc, char* argv[])
                 break;
             }
         }
+
         // 为了避免内存超限，我们在q.guesses中口令达到一定数目时，将其中的所有口令取出并且进行哈希
         // 然后，q.guesses将会被清空。为了有效记录已经生成的口令总数，维护一个history变量来进行记录
         if (curr_num > 1000000)
         {
             auto start_hash = system_clock::now();
-
-            string simd_inputs[4];
-            bit32 simd_states[4][4];
-            int simd_count = 0;
-
             bit32 state[4];
             for (string pw : q.guesses)
             {
                 // TODO：对于SIMD实验，将这里替换成你的SIMD MD5函数
-                simd_inputs[simd_count] = pw;
-                simd_count++;
-
-                if (simd_count == 4)
-                {
-                    MD5Hash_SIMD4(simd_inputs, simd_states);
-                    simd_count = 0;
-                }
+                MD5Hash(pw, state);
 
                 // 以下注释部分用于输出猜测和哈希，但是由于自动测试系统不太能写文件，所以这里你可以改成cout
                 // a<<pw<<"\t";
@@ -138,12 +130,6 @@ int main(int argc, char* argv[])
                 //     a << std::setw(8) << std::setfill('0') << hex << state[i1];
                 // }
                 // a << endl;
-            }
-
-            // q.guesses中的数量不一定正好是4的倍数，剩余不足4个的口令仍然使用串行MD5处理
-            for (int i = 0; i < simd_count; i++)
-            {
-                MD5Hash(simd_inputs[i], state);
             }
 
             // 在这里对哈希所需的总时长进行计算
@@ -157,4 +143,7 @@ int main(int argc, char* argv[])
             q.guesses.clear();
         }
     }
+
+    q.shutdown_thread_pool();
+    return 0;
 }

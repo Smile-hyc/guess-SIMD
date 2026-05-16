@@ -38,7 +38,6 @@ public:
     // 根据id，在freqs中查找/修改一个value的频数
     unordered_map<int, int> freqs;
 
-
     void insert(string value);
     void order();
     void PrintValues();
@@ -155,7 +154,10 @@ struct ThreadGenerateArgs
 class PriorityQueue
 {
 public:
-    // Pthread 动态线程版本参数
+    PriorityQueue() = default;
+    ~PriorityQueue();
+
+    // Pthread 线程池版本参数
     int pthread_thread_num = 4;      // 默认使用 4 个线程
     int pthread_threshold = 1000;    // 小于该规模时走串行
 
@@ -176,6 +178,24 @@ public:
 
     // 将优先队列最前面的一个PT
     void PopNext();
+
     int total_guesses = 0;
     vector<string> guesses;
+
+    // 静态线程池成员
+    vector<pthread_t> pool_threads;
+    queue<ThreadGenerateArgs*> task_queue;
+
+    pthread_mutex_t pool_mutex;
+    pthread_cond_t pool_task_available_cond;
+    pthread_cond_t pool_tasks_all_done_cond;
+
+    bool pool_initialized = false;
+    bool pool_shutdown_flag = false;
+    int pool_pending_tasks_count = 0;
+
+    // 静态线程池接口
+    void init_thread_pool(int num_threads);
+    void shutdown_thread_pool();
+    static void* worker_thread_function(void* arg);
 };

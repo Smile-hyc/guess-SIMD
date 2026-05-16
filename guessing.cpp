@@ -1,4 +1,5 @@
 #include "PCFG.h"
+#include <algorithm>
 using namespace std;
 
 void PriorityQueue::CalProb(PT &pt)
@@ -14,7 +15,6 @@ void PriorityQueue::CalProb(PT &pt)
 
     // index: 标注当前segment在PT中的位置
     int index = 0;
-
 
     for (int idx : pt.curr_indices)
     {
@@ -91,7 +91,6 @@ void PriorityQueue::init()
 
 void PriorityQueue::PopNext()
 {
-
     // 对优先队列最前面的PT，首先利用这个PT生成一系列猜测
     Generate(priority.front());
 
@@ -177,7 +176,7 @@ vector<PT> PT::NewPTs()
 }
 
 // Pthread 工作函数：处理 ordered_values 的一个连续区间
-// 每个线程只写自己的 local_guesses，不直接写全局 guesses
+// 静态线程池和动态线程版本都可以复用这个函数
 static void* process_segment_range(void* arg)
 {
     ThreadGenerateArgs* args = static_cast<ThreadGenerateArgs*>(arg);
@@ -224,6 +223,136 @@ static void* process_segment_range(void* arg)
     return nullptr;
 }
 
+// 析构时兜底关闭线程池，防止忘记手动 shutdown
+PriorityQueue::~PriorityQueue()
+{
+    shutdown_thread_pool();
+}
+
+// 初始化静态线程池
+void PriorityQueue::init_thread_pool(int num_threads)
+{
+    if (num_threads <= 0)
+    {
+        num_threads = 1;
+    }
+
+    // 如果之前已经初始化过，先关闭旧线程池
+    shutdown_thread_pool();
+
+    pthread_mutex_init(&pool_mutex, nullptr);
+    pthread_cond_init(&pool_task_available_cond, nullptr);
+    pthread_cond_init(&pool_tasks_all_done_cond, nullptr);
+
+    pool_shutdown_flag = false;
+    pool_pending_tasks_count = 0;
+    pool_initialized = true;
+
+    pool_threads.resize(num_threads);
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        int ret = pthread_create(
+            &pool_threads[i],
+            nullptr,
+            PriorityQueue::worker_thread_function,
+            this
+        );
+
+        if (ret != 0)
+        {
+            cerr << "Error: failed to create worker thread " << i << endl;
+            pool_threads.resize(i);
+            shutdown_thread_pool();
+            break;
+        }
+    }
+}
+
+// 关闭静态线程池
+void PriorityQueue::shutdown_thread_pool()
+{
+    if (!pool_initialized)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&pool_mutex);
+    pool_shutdown_flag = true;
+    pthread_mutex_unlock(&pool_mutex);
+
+    pthread_cond_broadcast(&pool_task_available_cond);
+
+    for (size_t i = 0; i < pool_threads.size(); i++)
+    {
+        pthread_join(pool_threads[i], nullptr);
+    }
+
+    pool_threads.clear();
+
+    pthread_mutex_destroy(&pool_mutex);
+    pthread_cond_destroy(&pool_task_available_cond);
+    pthread_cond_destroy(&pool_tasks_all_done_cond);
+
+    pool_shutdown_flag = false;
+    pool_pending_tasks_count = 0;
+    pool_initialized = false;
+
+    while (!task_queue.empty())
+    {
+        task_queue.pop();
+    }
+}
+
+// 静态线程池工作线程函数
+void* PriorityQueue::worker_thread_function(void* arg)
+{
+    PriorityQueue* pq = static_cast<PriorityQueue*>(arg);
+
+    while (true)
+    {
+        ThreadGenerateArgs* task = nullptr;
+
+        pthread_mutex_lock(&pq->pool_mutex);
+
+        while (pq->task_queue.empty() && !pq->pool_shutdown_flag)
+        {
+            pthread_cond_wait(&pq->pool_task_available_cond, &pq->pool_mutex);
+        }
+
+        if (pq->pool_shutdown_flag && pq->task_queue.empty())
+        {
+            pthread_mutex_unlock(&pq->pool_mutex);
+            break;
+        }
+
+        if (!pq->task_queue.empty())
+        {
+            task = pq->task_queue.front();
+            pq->task_queue.pop();
+        }
+
+        pthread_mutex_unlock(&pq->pool_mutex);
+
+        if (task != nullptr)
+        {
+            process_segment_range(task);
+
+            pthread_mutex_lock(&pq->pool_mutex);
+            pq->pool_pending_tasks_count -= 1;
+
+            if (pq->pool_pending_tasks_count == 0)
+            {
+                pthread_cond_signal(&pq->pool_tasks_all_done_cond);
+            }
+
+            pthread_mutex_unlock(&pq->pool_mutex);
+        }
+    }
+
+    return nullptr;
+}
+
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
 void PriorityQueue::Generate(PT pt)
@@ -231,11 +360,14 @@ void PriorityQueue::Generate(PT pt)
     // 计算PT的概率，这里主要是给PT的概率进行初始化
     CalProb(pt);
 
+    segment* a = nullptr;
+    string guess = "";
+    int loop_bound = 0;
+
     // 对于只有一个segment的PT，直接遍历生成其中的所有value即可
     if (pt.content.size() == 1)
     {
         // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
         // 在模型中定位到这个segment
         if (pt.content[0].type == 1)
         {
@@ -249,90 +381,11 @@ void PriorityQueue::Generate(PT pt)
         {
             a = &m.symbols[m.FindSymbol(pt.content[0])];
         }
-        
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
 
-        // Pthread 动态线程版本：先判断任务规模，小任务仍然走串行
-        int loop_bound = pt.max_indices[0];
-        int actual_size = a->ordered_values.size();
-
-        if (loop_bound > actual_size)
-        {
-            loop_bound = actual_size;
-        }
-
-        if (loop_bound < pthread_threshold || pthread_thread_num <= 1)
-        {
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                string guess = a->ordered_values[i];
-                // cout << guess << endl;
-                guesses.emplace_back(guess);
-                total_guesses += 1;
-            }
-        }
-        else
-        {
-            int thread_num = pthread_thread_num;
-
-            if (thread_num < 1)
-            {
-                thread_num = 1;
-            }
-
-            if (loop_bound < thread_num)
-            {
-                thread_num = loop_bound;
-            }
-
-            vector<pthread_t> threads(thread_num);
-            vector<ThreadGenerateArgs> thread_args(thread_num);
-
-            int base = loop_bound / thread_num;
-            int remain = loop_bound % thread_num;
-            int current_start = 0;
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                int current_count = base;
-                if (t < remain)
-                {
-                    current_count += 1;
-                }
-
-                thread_args[t].start_index = current_start;
-                thread_args[t].end_index = current_start + current_count;
-                thread_args[t].segment_data = a;
-                thread_args[t].prefix = "";
-
-                pthread_create(&threads[t], nullptr, process_segment_range, &thread_args[t]);
-
-                current_start += current_count;
-            }
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                pthread_join(threads[t], nullptr);
-            }
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                guesses.insert(
-                    guesses.end(),
-                    thread_args[t].local_guesses.begin(),
-                    thread_args[t].local_guesses.end()
-                );
-
-                total_guesses += thread_args[t].local_count;
-            }
-        }
+        loop_bound = pt.max_indices[0];
     }
     else
     {
-        string guess;
         int seg_idx = 0;
         // 这个for循环的作用：给当前PT的所有segment赋予实际的值（最后一个segment除外）
         // segment值根据curr_indices中对应的值加以确定
@@ -359,99 +412,134 @@ void PriorityQueue::Generate(PT pt)
         }
 
         // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
-        if (pt.content[pt.content.size() - 1].type == 1)
-        {
-            a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
-        }
-        if (pt.content[pt.content.size() - 1].type == 2)
-        {
-            a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
-        }
-        if (pt.content[pt.content.size() - 1].type == 3)
-        {
-            a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
-        }
-        
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
-
-        // Pthread 动态线程版本：先判断任务规模，小任务仍然走串行
         int last_idx = pt.content.size() - 1;
-        int loop_bound = pt.max_indices[last_idx];
-        int actual_size = a->ordered_values.size();
 
-        if (loop_bound > actual_size)
+        if (pt.content[last_idx].type == 1)
         {
-            loop_bound = actual_size;
+            a = &m.letters[m.FindLetter(pt.content[last_idx])];
+        }
+        if (pt.content[last_idx].type == 2)
+        {
+            a = &m.digits[m.FindDigit(pt.content[last_idx])];
+        }
+        if (pt.content[last_idx].type == 3)
+        {
+            a = &m.symbols[m.FindSymbol(pt.content[last_idx])];
         }
 
-        if (loop_bound < pthread_threshold || pthread_thread_num <= 1)
+        loop_bound = pt.max_indices[last_idx];
+    }
+
+    if (a == nullptr)
+    {
+        return;
+    }
+
+    int actual_size = a->ordered_values.size();
+    if (loop_bound > actual_size)
+    {
+        loop_bound = actual_size;
+    }
+
+    if (loop_bound <= 0)
+    {
+        return;
+    }
+
+    // 小任务或线程池未初始化时，回退到串行路径
+    if (!pool_initialized || pool_threads.empty() ||
+        pthread_thread_num <= 1 || loop_bound < pthread_threshold)
+    {
+        for (int i = 0; i < loop_bound; i += 1)
         {
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                string temp = guess + a->ordered_values[i];
-                // cout << temp << endl;
-                guesses.emplace_back(temp);
-                total_guesses += 1;
-            }
+            string temp = guess + a->ordered_values[i];
+            guesses.emplace_back(temp);
+            total_guesses += 1;
         }
-        else
+        return;
+    }
+
+    int thread_num = pthread_thread_num;
+
+    if (thread_num < 1)
+    {
+        thread_num = 1;
+    }
+
+    if (thread_num > (int)pool_threads.size())
+    {
+        thread_num = pool_threads.size();
+    }
+
+    if (loop_bound < thread_num)
+    {
+        thread_num = loop_bound;
+    }
+
+    vector<ThreadGenerateArgs> thread_args(thread_num);
+
+    int base = loop_bound / thread_num;
+    int remain = loop_bound % thread_num;
+    int current_start = 0;
+    int tasks_created = 0;
+
+    for (int t = 0; t < thread_num; t++)
+    {
+        int current_count = base;
+        if (t < remain)
         {
-            int thread_num = pthread_thread_num;
-
-            if (thread_num < 1)
-            {
-                thread_num = 1;
-            }
-
-            if (loop_bound < thread_num)
-            {
-                thread_num = loop_bound;
-            }
-
-            vector<pthread_t> threads(thread_num);
-            vector<ThreadGenerateArgs> thread_args(thread_num);
-
-            int base = loop_bound / thread_num;
-            int remain = loop_bound % thread_num;
-            int current_start = 0;
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                int current_count = base;
-                if (t < remain)
-                {
-                    current_count += 1;
-                }
-
-                thread_args[t].start_index = current_start;
-                thread_args[t].end_index = current_start + current_count;
-                thread_args[t].segment_data = a;
-                thread_args[t].prefix = guess;
-
-                pthread_create(&threads[t], nullptr, process_segment_range, &thread_args[t]);
-
-                current_start += current_count;
-            }
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                pthread_join(threads[t], nullptr);
-            }
-
-            for (int t = 0; t < thread_num; t++)
-            {
-                guesses.insert(
-                    guesses.end(),
-                    thread_args[t].local_guesses.begin(),
-                    thread_args[t].local_guesses.end()
-                );
-
-                total_guesses += thread_args[t].local_count;
-            }
+            current_count += 1;
         }
+
+        if (current_count <= 0)
+        {
+            continue;
+        }
+
+        thread_args[tasks_created].start_index = current_start;
+        thread_args[tasks_created].end_index = current_start + current_count;
+        thread_args[tasks_created].segment_data = a;
+        thread_args[tasks_created].prefix = guess;
+        thread_args[tasks_created].local_guesses.clear();
+        thread_args[tasks_created].local_count = 0;
+
+        current_start += current_count;
+        tasks_created += 1;
+    }
+
+    if (tasks_created <= 0)
+    {
+        return;
+    }
+
+    // 将任务一次性塞入任务队列，并唤醒工作线程
+    pthread_mutex_lock(&pool_mutex);
+
+    pool_pending_tasks_count = tasks_created;
+
+    for (int i = 0; i < tasks_created; i++)
+    {
+        task_queue.push(&thread_args[i]);
+    }
+
+    pthread_cond_broadcast(&pool_task_available_cond);
+
+    while (pool_pending_tasks_count > 0)
+    {
+        pthread_cond_wait(&pool_tasks_all_done_cond, &pool_mutex);
+    }
+
+    pthread_mutex_unlock(&pool_mutex);
+
+    // 所有任务完成后，由主线程统一合并局部结果
+    for (int i = 0; i < tasks_created; i++)
+    {
+        guesses.insert(
+            guesses.end(),
+            thread_args[i].local_guesses.begin(),
+            thread_args[i].local_guesses.end()
+        );
+
+        total_guesses += thread_args[i].local_count;
     }
 }
