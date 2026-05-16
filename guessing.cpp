@@ -1,19 +1,12 @@
 #include "PCFG.h"
 #include <algorithm>
+#include <vector>
 using namespace std;
 
 void PriorityQueue::CalProb(PT &pt)
 {
-    // 计算PriorityQueue里面一个PT的流程如下：
-    // 1. 首先需要计算一个PT本身的概率。例如，L6S1的概率为0.15
-    // 2. 需要注意的是，Queue里面的PT不是“纯粹的”PT，而是除了最后一个segment以外，全部被value实例化的PT
-    // 3. 所以，对于L6S1而言，其在Queue里面的实际PT可能是123456S1，其中“123456”为L6的一个具体value。
-    // 4. 这个时候就需要计算123456在L6中出现的概率了。假设123456在所有L6 segment中的概率为0.1，那么123456S1的概率就是0.1*0.15
-
-    // 计算一个PT本身的概率。后续所有具体segment value的概率，直接累乘在这个初始概率值上
     pt.prob = pt.preterm_prob;
 
-    // index: 标注当前segment在PT中的位置
     int index = 0;
 
     for (int idx : pt.curr_indices)
@@ -23,85 +16,86 @@ void PriorityQueue::CalProb(PT &pt)
             pt.prob *= m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.letters[m.FindLetter(pt.content[index])].total_freq;
         }
+
         if (pt.content[index].type == 2)
         {
             pt.prob *= m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.digits[m.FindDigit(pt.content[index])].total_freq;
         }
+
         if (pt.content[index].type == 3)
         {
             pt.prob *= m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.symbols[m.FindSymbol(pt.content[index])].total_freq;
         }
+
         index += 1;
     }
 }
 
 void PriorityQueue::init()
 {
-    // cout << m.ordered_pts.size() << endl;
-    // 用所有可能的PT，按概率降序填满整个优先队列
     for (PT pt : m.ordered_pts)
     {
         for (segment seg : pt.content)
         {
             if (seg.type == 1)
             {
-                // 下面这行代码的意义：
-                // max_indices用来表示PT中各个segment的可能数目。例如，L6S1中，假设模型统计到了100个L6，那么L6对应的最大下标就是99
-                // （但由于后面采用了"<"的比较关系，所以其实max_indices[0]=100）
-                // m.FindLetter(seg): 找到一个letter segment在模型中的对应下标
-                // m.letters[m.FindLetter(seg)]：一个letter segment在模型中对应的所有统计数据
-                // m.letters[m.FindLetter(seg)].ordered_values：一个letter segment在模型中，所有value的总数目
-                pt.max_indices.emplace_back(m.letters[m.FindLetter(seg)].ordered_values.size());
+                pt.max_indices.emplace_back(
+                    m.letters[m.FindLetter(seg)].ordered_values.size()
+                );
             }
+
             if (seg.type == 2)
             {
-                pt.max_indices.emplace_back(m.digits[m.FindDigit(seg)].ordered_values.size());
+                pt.max_indices.emplace_back(
+                    m.digits[m.FindDigit(seg)].ordered_values.size()
+                );
             }
+
             if (seg.type == 3)
             {
-                pt.max_indices.emplace_back(m.symbols[m.FindSymbol(seg)].ordered_values.size());
+                pt.max_indices.emplace_back(
+                    m.symbols[m.FindSymbol(seg)].ordered_values.size()
+                );
             }
         }
+
         pt.preterm_prob = float(m.preterm_freq[m.FindPT(pt)]) / m.total_preterm;
 
-        // 计算当前pt的概率
         CalProb(pt);
-        // 将PT放入优先队列
+
         priority.emplace_back(pt);
     }
 }
 
 void PriorityQueue::PopNext()
 {
-    // 对优先队列最前面的PT，首先利用这个PT生成一系列猜测
     Generate(priority.front());
 
-    // 然后需要根据即将出队的PT，生成一系列新的PT
     vector<PT> new_pts = priority.front().NewPTs();
+
     for (PT pt : new_pts)
     {
-        // 计算概率
         CalProb(pt);
-        // 接下来的这个循环，作用是根据概率，将新的PT插入到优先队列中
+
         for (auto iter = priority.begin(); iter != priority.end(); iter++)
         {
-            // 对于非队首和队尾的特殊情况
             if (iter != priority.end() - 1 && iter != priority.begin())
             {
-                // 判定概率
                 if (pt.prob <= iter->prob && pt.prob > (iter + 1)->prob)
                 {
                     priority.emplace(iter + 1, pt);
                     break;
                 }
             }
+
             if (iter == priority.end() - 1)
             {
                 priority.emplace_back(pt);
                 break;
             }
+
             if (iter == priority.begin() && iter->prob < pt.prob)
             {
                 priority.emplace(iter, pt);
@@ -110,48 +104,34 @@ void PriorityQueue::PopNext()
         }
     }
 
-    // 现在队首的PT善后工作已经结束，将其出队（删除）
     priority.erase(priority.begin());
 }
 
-// 这个函数你就算看不懂，对并行算法的实现影响也不大
-// 当然如果你想做一个基于多优先队列的并行算法，可能得稍微看一看了
 vector<PT> PT::NewPTs()
 {
-    // 存储生成的新PT
     vector<PT> res;
 
-    // 假如这个PT只有一个segment
-    // 那么这个segment的所有value在出队前就已经被遍历完毕，并作为猜测输出
-    // 因此，所有这个PT可能对应的口令猜测已经遍历完成，无需生成新的PT
     if (content.size() == 1)
     {
         return res;
     }
     else
     {
-        // 最初的pivot值。我们将更改位置下标大于等于这个pivot值的segment的值（最后一个segment除外），并且一次只更改一个segment
-        // 上面这句话里是不是有没看懂的地方？接着往下看你应该会更明白
         int init_pivot = pivot;
 
-        // 开始遍历所有位置值大于等于init_pivot值的segment
-        // 注意i < curr_indices.size() - 1，也就是除去了最后一个segment（这个segment的赋值预留给并行环节）
         for (int i = pivot; i < curr_indices.size() - 1; i += 1)
         {
-            // curr_indices: 标记各segment目前的value在模型里对应的下标
             curr_indices[i] += 1;
 
-            // max_indices：标记各segment在模型中一共有多少个value
             if (curr_indices[i] < max_indices[i])
             {
-                // 更新pivot值
                 pivot = i;
                 res.emplace_back(*this);
             }
 
-            // 这个步骤对于你理解pivot的作用、新PT生成的过程而言，至关重要
             curr_indices[i] -= 1;
         }
+
         pivot = init_pivot;
         return res;
     }
@@ -159,35 +139,10 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
-// 设置 OpenMP 调度策略
-static void set_openmp_schedule(int schedule_type, int chunk_size)
-{
-    if (chunk_size <= 0)
-    {
-        chunk_size = 1;
-    }
-
-    if (schedule_type == 0)
-    {
-        omp_set_schedule(omp_sched_static, chunk_size);
-    }
-    else if (schedule_type == 1)
-    {
-        omp_set_schedule(omp_sched_dynamic, chunk_size);
-    }
-    else if (schedule_type == 2)
-    {
-        omp_set_schedule(omp_sched_guided, chunk_size);
-    }
-    else
-    {
-        omp_set_schedule(omp_sched_static, chunk_size);
-    }
-}
-
-// OpenMP Segment Filling 公共函数
-// 每个线程先写自己的 local vector，最后主线程统一合并
-static void generate_segment_openmp(
+// OpenMP dynamic 调度版本：
+// 小任务走串行，大任务进入 parallel for。
+// 每个线程写自己的 local vector，parallel 结束后主线程统一合并。
+static void generate_segment_openmp_dynamic(
     vector<string>& guesses,
     int& total_guesses,
     segment* seg_data,
@@ -195,7 +150,6 @@ static void generate_segment_openmp(
     int loop_bound,
     int thread_num,
     int threshold,
-    int schedule_type,
     int chunk_size)
 {
     if (seg_data == nullptr)
@@ -204,6 +158,7 @@ static void generate_segment_openmp(
     }
 
     int actual_size = seg_data->ordered_values.size();
+
     if (loop_bound > actual_size)
     {
         loop_bound = actual_size;
@@ -214,14 +169,24 @@ static void generate_segment_openmp(
         return;
     }
 
-    // 小任务直接串行，避免 OpenMP parallel 区域开销
     if (thread_num <= 1 || loop_bound < threshold)
     {
-        for (int i = 0; i < loop_bound; i++)
+        if (prefix.empty())
         {
-            guesses.emplace_back(prefix + seg_data->ordered_values[i]);
-            total_guesses += 1;
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                guesses.emplace_back(seg_data->ordered_values[i]);
+            }
         }
+        else
+        {
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                guesses.emplace_back(prefix + seg_data->ordered_values[i]);
+            }
+        }
+
+        total_guesses += loop_bound;
         return;
     }
 
@@ -230,134 +195,185 @@ static void generate_segment_openmp(
         thread_num = loop_bound;
     }
 
-    set_openmp_schedule(schedule_type, chunk_size);
+    if (chunk_size <= 0)
+    {
+        chunk_size = 1;
+    }
 
-    vector<vector<string>> thread_local_guesses(thread_num);
-    vector<int> thread_local_count(thread_num, 0);
+    const vector<string>& values = seg_data->ordered_values;
+
+    vector<vector<string>> all_local_guesses(thread_num);
 
 #pragma omp parallel num_threads(thread_num)
     {
         int tid = omp_get_thread_num();
-        thread_local_guesses[tid].reserve((loop_bound / thread_num) + 8);
 
-#pragma omp for schedule(runtime)
-        for (int i = 0; i < loop_bound; i++)
+        vector<string> local_guesses;
+        local_guesses.reserve(loop_bound / thread_num + chunk_size + 8);
+
+        if (prefix.empty())
         {
-            thread_local_guesses[tid].emplace_back(prefix + seg_data->ordered_values[i]);
+#pragma omp for schedule(dynamic, chunk_size) nowait
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                local_guesses.emplace_back(values[i]);
+            }
+        }
+        else
+        {
+#pragma omp for schedule(dynamic, chunk_size) nowait
+            for (int i = 0; i < loop_bound; i += 1)
+            {
+                local_guesses.emplace_back(prefix + values[i]);
+            }
         }
 
-        thread_local_count[tid] = thread_local_guesses[tid].size();
+        all_local_guesses[tid].swap(local_guesses);
     }
 
-    // 所有线程结束后，主线程统一合并，避免多线程直接写全局 guesses
-    for (int t = 0; t < thread_num; t++)
+    for (int t = 0; t < thread_num; t += 1)
     {
         guesses.insert(
             guesses.end(),
-            thread_local_guesses[t].begin(),
-            thread_local_guesses[t].end()
+            all_local_guesses[t].begin(),
+            all_local_guesses[t].end()
         );
-        total_guesses += thread_local_count[t];
     }
+
+    total_guesses += loop_bound;
 }
 
-// 这个函数是PCFG并行化算法的主要载体
-// 尽量看懂，然后进行并行实现
 void PriorityQueue::Generate(PT pt)
 {
-    // 计算PT的概率，这里主要是给PT的概率进行初始化
     CalProb(pt);
 
-    segment* a = nullptr;
-    string guess = "";
-    int loop_bound = 0;
-
-    // 对于只有一个segment的PT，直接遍历生成其中的所有value即可
     if (pt.content.size() == 1)
     {
-        // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        // 在模型中定位到这个segment
+        if (pt.content.empty() || pt.max_indices.empty())
+        {
+            return;
+        }
+
+        segment* target_segment_data = nullptr;
+
         if (pt.content[0].type == 1)
         {
-            a = &m.letters[m.FindLetter(pt.content[0])];
+            target_segment_data = &m.letters[m.FindLetter(pt.content[0])];
         }
-        if (pt.content[0].type == 2)
+        else if (pt.content[0].type == 2)
         {
-            a = &m.digits[m.FindDigit(pt.content[0])];
+            target_segment_data = &m.digits[m.FindDigit(pt.content[0])];
         }
-        if (pt.content[0].type == 3)
+        else if (pt.content[0].type == 3)
         {
-            a = &m.symbols[m.FindSymbol(pt.content[0])];
+            target_segment_data = &m.symbols[m.FindSymbol(pt.content[0])];
         }
 
-        loop_bound = pt.max_indices[0];
+        if (target_segment_data == nullptr)
+        {
+            return;
+        }
 
-        generate_segment_openmp(
+        int loop_bound = pt.max_indices[0];
+
+        generate_segment_openmp_dynamic(
             guesses,
             total_guesses,
-            a,
+            target_segment_data,
             "",
             loop_bound,
             omp_thread_num,
             omp_threshold,
-            omp_schedule_type,
             omp_chunk_size
         );
     }
     else
     {
+        if (pt.content.empty() ||
+            pt.curr_indices.empty() ||
+            pt.max_indices.size() != pt.content.size())
+        {
+            return;
+        }
+
+        string prefix_guess_str;
         int seg_idx = 0;
-        // 这个for循环的作用：给当前PT的所有segment赋予实际的值（最后一个segment除外）
-        // segment值根据curr_indices中对应的值加以确定
-        // 这个for循环你看不懂也没太大问题，并行算法不涉及这里的加速
+
         for (int idx : pt.curr_indices)
         {
-            if (pt.content[seg_idx].type == 1)
-            {
-                guess += m.letters[m.FindLetter(pt.content[seg_idx])].ordered_values[idx];
-            }
-            if (pt.content[seg_idx].type == 2)
-            {
-                guess += m.digits[m.FindDigit(pt.content[seg_idx])].ordered_values[idx];
-            }
-            if (pt.content[seg_idx].type == 3)
-            {
-                guess += m.symbols[m.FindSymbol(pt.content[seg_idx])].ordered_values[idx];
-            }
-            seg_idx += 1;
-            if (seg_idx == pt.content.size() - 1)
+            if (seg_idx >= pt.content.size() - 1)
             {
                 break;
             }
+
+            const segment& current_seg_template = pt.content[seg_idx];
+            const segment* concrete_segment_data = nullptr;
+
+            if (current_seg_template.type == 1)
+            {
+                concrete_segment_data = &m.letters[m.FindLetter(current_seg_template)];
+            }
+            else if (current_seg_template.type == 2)
+            {
+                concrete_segment_data = &m.digits[m.FindDigit(current_seg_template)];
+            }
+            else if (current_seg_template.type == 3)
+            {
+                concrete_segment_data = &m.symbols[m.FindSymbol(current_seg_template)];
+            }
+
+            if (concrete_segment_data &&
+                idx >= 0 &&
+                idx < concrete_segment_data->ordered_values.size())
+            {
+                prefix_guess_str += concrete_segment_data->ordered_values[idx];
+            }
+            else
+            {
+                return;
+            }
+
+            seg_idx += 1;
         }
 
-        // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        int last_idx = pt.content.size() - 1;
+        segment* last_segment_data = nullptr;
+        int last_segment_idx = pt.content.size() - 1;
 
-        if (pt.content[last_idx].type == 1)
+        if (last_segment_idx < 0)
         {
-            a = &m.letters[m.FindLetter(pt.content[last_idx])];
-        }
-        if (pt.content[last_idx].type == 2)
-        {
-            a = &m.digits[m.FindDigit(pt.content[last_idx])];
-        }
-        if (pt.content[last_idx].type == 3)
-        {
-            a = &m.symbols[m.FindSymbol(pt.content[last_idx])];
+            return;
         }
 
-        loop_bound = pt.max_indices[last_idx];
+        const segment& last_seg_template = pt.content[last_segment_idx];
 
-        generate_segment_openmp(
+        if (last_seg_template.type == 1)
+        {
+            last_segment_data = &m.letters[m.FindLetter(last_seg_template)];
+        }
+        else if (last_seg_template.type == 2)
+        {
+            last_segment_data = &m.digits[m.FindDigit(last_seg_template)];
+        }
+        else if (last_seg_template.type == 3)
+        {
+            last_segment_data = &m.symbols[m.FindSymbol(last_seg_template)];
+        }
+
+        if (last_segment_data == nullptr)
+        {
+            return;
+        }
+
+        int loop_bound = pt.max_indices[last_segment_idx];
+
+        generate_segment_openmp_dynamic(
             guesses,
             total_guesses,
-            a,
-            guess,
+            last_segment_data,
+            prefix_guess_str,
             loop_bound,
             omp_thread_num,
             omp_threshold,
-            omp_schedule_type,
             omp_chunk_size
         );
     }
