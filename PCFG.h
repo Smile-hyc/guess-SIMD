@@ -2,6 +2,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <queue>
+#include <vector>
 #include <omp.h>
 // #include <chrono>   
 // using namespace chrono;
@@ -36,7 +37,6 @@ public:
     // 根据id，在freqs中查找/修改一个value的频数
     unordered_map<int, int> freqs;
 
-
     void insert(string value);
     void order();
     void PrintValues();
@@ -61,7 +61,7 @@ public:
 
     // 记录当前每个segment（除了最后一个）对应的value，在模型中的最大下标（即最大可以是max_indices[x]-1）
     vector<int> max_indices;
-    // void init();
+
     float preterm_prob;
     float prob;
 };
@@ -140,6 +140,12 @@ public:
 class PriorityQueue
 {
 public:
+    // OpenMP 版本参数
+    int omp_thread_num = 4;       // 默认使用 4 个线程
+    int omp_threshold = 1000;     // 小任务走串行，大任务才并行
+    int omp_schedule_type = 0;    // 0: static, 1: dynamic, 2: guided
+    int omp_chunk_size = 1000;    // dynamic/guided 调度时使用
+
     // 用vector实现的priority queue
     vector<PT> priority;
 
@@ -157,6 +163,7 @@ public:
 
     // 将优先队列最前面的一个PT
     void PopNext();
+
     int total_guesses = 0;
     vector<string> guesses;
 };

@@ -1,4 +1,5 @@
 #include "PCFG.h"
+#include <algorithm>
 using namespace std;
 
 void PriorityQueue::CalProb(PT &pt)
@@ -15,39 +16,25 @@ void PriorityQueue::CalProb(PT &pt)
     // index: 标注当前segment在PT中的位置
     int index = 0;
 
-
     for (int idx : pt.curr_indices)
     {
-        // pt.content[index].PrintSeg();
         if (pt.content[index].type == 1)
         {
-            // 下面这行代码的意义：
-            // pt.content[index]：目前需要计算概率的segment
-            // m.FindLetter(seg): 找到一个letter segment在模型中的对应下标
-            // m.letters[m.FindLetter(seg)]：一个letter segment在模型中对应的所有统计数据
-            // m.letters[m.FindLetter(seg)].ordered_values：一个letter segment在模型中，所有value的总数目
             pt.prob *= m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.letters[m.FindLetter(pt.content[index])].total_freq;
-            // cout << m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx] << endl;
-            // cout << m.letters[m.FindLetter(pt.content[index])].total_freq << endl;
         }
         if (pt.content[index].type == 2)
         {
             pt.prob *= m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.digits[m.FindDigit(pt.content[index])].total_freq;
-            // cout << m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx] << endl;
-            // cout << m.digits[m.FindDigit(pt.content[index])].total_freq << endl;
         }
         if (pt.content[index].type == 3)
         {
             pt.prob *= m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx];
             pt.prob /= m.symbols[m.FindSymbol(pt.content[index])].total_freq;
-            // cout << m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx] << endl;
-            // cout << m.symbols[m.FindSymbol(pt.content[index])].total_freq << endl;
         }
         index += 1;
     }
-    // cout << pt.prob << endl;
 }
 
 void PriorityQueue::init()
@@ -78,20 +65,16 @@ void PriorityQueue::init()
             }
         }
         pt.preterm_prob = float(m.preterm_freq[m.FindPT(pt)]) / m.total_preterm;
-        // pt.PrintPT();
-        // cout << " " << m.preterm_freq[m.FindPT(pt)] << " " << m.total_preterm << " " << pt.preterm_prob << endl;
 
         // 计算当前pt的概率
         CalProb(pt);
         // 将PT放入优先队列
         priority.emplace_back(pt);
     }
-    // cout << "priority size:" << priority.size() << endl;
 }
 
 void PriorityQueue::PopNext()
 {
-
     // 对优先队列最前面的PT，首先利用这个PT生成一系列猜测
     Generate(priority.front());
 
@@ -176,6 +159,107 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
+// 设置 OpenMP 调度策略
+static void set_openmp_schedule(int schedule_type, int chunk_size)
+{
+    if (chunk_size <= 0)
+    {
+        chunk_size = 1;
+    }
+
+    if (schedule_type == 0)
+    {
+        omp_set_schedule(omp_sched_static, chunk_size);
+    }
+    else if (schedule_type == 1)
+    {
+        omp_set_schedule(omp_sched_dynamic, chunk_size);
+    }
+    else if (schedule_type == 2)
+    {
+        omp_set_schedule(omp_sched_guided, chunk_size);
+    }
+    else
+    {
+        omp_set_schedule(omp_sched_static, chunk_size);
+    }
+}
+
+// OpenMP Segment Filling 公共函数
+// 每个线程先写自己的 local vector，最后主线程统一合并
+static void generate_segment_openmp(
+    vector<string>& guesses,
+    int& total_guesses,
+    segment* seg_data,
+    const string& prefix,
+    int loop_bound,
+    int thread_num,
+    int threshold,
+    int schedule_type,
+    int chunk_size)
+{
+    if (seg_data == nullptr)
+    {
+        return;
+    }
+
+    int actual_size = seg_data->ordered_values.size();
+    if (loop_bound > actual_size)
+    {
+        loop_bound = actual_size;
+    }
+
+    if (loop_bound <= 0)
+    {
+        return;
+    }
+
+    // 小任务直接串行，避免 OpenMP parallel 区域开销
+    if (thread_num <= 1 || loop_bound < threshold)
+    {
+        for (int i = 0; i < loop_bound; i++)
+        {
+            guesses.emplace_back(prefix + seg_data->ordered_values[i]);
+            total_guesses += 1;
+        }
+        return;
+    }
+
+    if (thread_num > loop_bound)
+    {
+        thread_num = loop_bound;
+    }
+
+    set_openmp_schedule(schedule_type, chunk_size);
+
+    vector<vector<string>> thread_local_guesses(thread_num);
+    vector<int> thread_local_count(thread_num, 0);
+
+#pragma omp parallel num_threads(thread_num)
+    {
+        int tid = omp_get_thread_num();
+        thread_local_guesses[tid].reserve((loop_bound / thread_num) + 8);
+
+#pragma omp for schedule(runtime)
+        for (int i = 0; i < loop_bound; i++)
+        {
+            thread_local_guesses[tid].emplace_back(prefix + seg_data->ordered_values[i]);
+        }
+
+        thread_local_count[tid] = thread_local_guesses[tid].size();
+    }
+
+    // 所有线程结束后，主线程统一合并，避免多线程直接写全局 guesses
+    for (int t = 0; t < thread_num; t++)
+    {
+        guesses.insert(
+            guesses.end(),
+            thread_local_guesses[t].begin(),
+            thread_local_guesses[t].end()
+        );
+        total_guesses += thread_local_count[t];
+    }
+}
 
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
@@ -184,11 +268,14 @@ void PriorityQueue::Generate(PT pt)
     // 计算PT的概率，这里主要是给PT的概率进行初始化
     CalProb(pt);
 
+    segment* a = nullptr;
+    string guess = "";
+    int loop_bound = 0;
+
     // 对于只有一个segment的PT，直接遍历生成其中的所有value即可
     if (pt.content.size() == 1)
     {
         // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
         // 在模型中定位到这个segment
         if (pt.content[0].type == 1)
         {
@@ -202,22 +289,23 @@ void PriorityQueue::Generate(PT pt)
         {
             a = &m.symbols[m.FindSymbol(pt.content[0])];
         }
-        
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[0]; i += 1)
-        {
-            string guess = a->ordered_values[i];
-            // cout << guess << endl;
-            guesses.emplace_back(guess);
-            total_guesses += 1;
-        }
+
+        loop_bound = pt.max_indices[0];
+
+        generate_segment_openmp(
+            guesses,
+            total_guesses,
+            a,
+            "",
+            loop_bound,
+            omp_thread_num,
+            omp_threshold,
+            omp_schedule_type,
+            omp_chunk_size
+        );
     }
     else
     {
-        string guess;
         int seg_idx = 0;
         // 这个for循环的作用：给当前PT的所有segment赋予实际的值（最后一个segment除外）
         // segment值根据curr_indices中对应的值加以确定
@@ -244,30 +332,33 @@ void PriorityQueue::Generate(PT pt)
         }
 
         // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
-        if (pt.content[pt.content.size() - 1].type == 1)
+        int last_idx = pt.content.size() - 1;
+
+        if (pt.content[last_idx].type == 1)
         {
-            a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
+            a = &m.letters[m.FindLetter(pt.content[last_idx])];
         }
-        if (pt.content[pt.content.size() - 1].type == 2)
+        if (pt.content[last_idx].type == 2)
         {
-            a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
+            a = &m.digits[m.FindDigit(pt.content[last_idx])];
         }
-        if (pt.content[pt.content.size() - 1].type == 3)
+        if (pt.content[last_idx].type == 3)
         {
-            a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
+            a = &m.symbols[m.FindSymbol(pt.content[last_idx])];
         }
-        
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
-        {
-            string temp = guess + a->ordered_values[i];
-            // cout << temp << endl;
-            guesses.emplace_back(temp);
-            total_guesses += 1;
-        }
+
+        loop_bound = pt.max_indices[last_idx];
+
+        generate_segment_openmp(
+            guesses,
+            total_guesses,
+            a,
+            guess,
+            loop_bound,
+            omp_thread_num,
+            omp_threshold,
+            omp_schedule_type,
+            omp_chunk_size
+        );
     }
 }
