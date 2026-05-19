@@ -4,14 +4,11 @@
 #include "md5.h"
 #include <iomanip>
 #include <unordered_set>
-#include <cstdlib>
+
 using namespace std;
 using namespace chrono;
 
-// 编译指令：
-// g++ -O2 -fopenmp correctness_guess_openmp.cpp train.cpp guessing.cpp md5.cpp -o correctness_guess_openmp
-
-int main(int argc, char* argv[])
+int main()
 {
     double time_hash = 0;
     double time_guess = 0;
@@ -19,46 +16,12 @@ int main(int argc, char* argv[])
 
     PriorityQueue q;
 
-    if (argc >= 2)
-    {
-        q.omp_thread_num = atoi(argv[1]);
-
-        if (q.omp_thread_num < 1)
-        {
-            q.omp_thread_num = 1;
-        }
-    }
-
-    if (argc >= 3)
-    {
-        q.omp_threshold = atoi(argv[2]);
-
-        if (q.omp_threshold < 0)
-        {
-            q.omp_threshold = 0;
-        }
-    }
-
-    if (argc >= 4)
-    {
-        q.omp_chunk_size = atoi(argv[3]);
-
-        if (q.omp_chunk_size <= 0)
-        {
-            q.omp_chunk_size = 1;
-        }
-    }
-
-    cout << "OpenMP threads: " << q.omp_thread_num << endl;
-    cout << "OpenMP threshold: " << q.omp_threshold << endl;
-    cout << "OpenMP schedule: dynamic" << endl;
-    cout << "OpenMP chunk size: " << q.omp_chunk_size << endl;
-
     auto start_train = system_clock::now();
+
     q.m.train("/guessdata/Rockyou-singleLined-full.txt");
     q.m.order();
-    auto end_train = system_clock::now();
 
+    auto end_train = system_clock::now();
     auto duration_train = duration_cast<microseconds>(end_train - start_train);
     time_train = double(duration_train.count()) * microseconds::period::num / microseconds::period::den;
 
@@ -87,20 +50,20 @@ int main(int argc, char* argv[])
 
     int curr_num = 0;
     int history = 0;
+    const int generate_n = 10000000;
 
     auto start = system_clock::now();
 
-    while (!q.priority.empty())
+    while (!q.Empty())
     {
         q.PopNext();
-        q.total_guesses = q.guesses.size();
+
+        q.total_guesses = (int)q.guesses.size();
 
         if (q.total_guesses - curr_num >= 100000)
         {
             cout << "Guesses generated: " << history + q.total_guesses << endl;
             curr_num = q.total_guesses;
-
-            int generate_n = 10000000;
 
             if (history + q.total_guesses > generate_n)
             {
@@ -117,13 +80,14 @@ int main(int argc, char* argv[])
             }
         }
 
+        // 为了避免内存超限，达到一定数量后进行 Hash 和测试集匹配，然后清空 guesses。
         if (curr_num > 1000000)
         {
             auto start_hash = system_clock::now();
 
             bit32 state[4];
 
-            for (string pw : q.guesses)
+            for (const string &pw : q.guesses)
             {
                 if (test_set.find(pw) != test_set.end())
                 {

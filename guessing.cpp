@@ -1,63 +1,270 @@
 #include "PCFG.h"
-#include <algorithm>
-#include <vector>
+
 using namespace std;
+
+static const int MQ_FACTOR = 2;              // local queue 数量约为 2 * OpenMP 最大线程数
+static const int MIN_OPENMP_GRAIN = 2048;    // 内部自动粒度控制，不需要命令行传阈值
+
+PriorityQueue::~PriorityQueue()
+{
+    DestroyMultiQueue();
+}
+
+segment *PriorityQueue::LocateSegment(const segment &seg)
+{
+    if (seg.type == 1)
+    {
+        int id = m.FindLetter(seg);
+        if (id >= 0)
+            return &m.letters[id];
+    }
+    else if (seg.type == 2)
+    {
+        int id = m.FindDigit(seg);
+        if (id >= 0)
+            return &m.digits[id];
+    }
+    else if (seg.type == 3)
+    {
+        int id = m.FindSymbol(seg);
+        if (id >= 0)
+            return &m.symbols[id];
+    }
+
+    return nullptr;
+}
 
 void PriorityQueue::CalProb(PT &pt)
 {
     pt.prob = pt.preterm_prob;
 
     int index = 0;
-
     for (int idx : pt.curr_indices)
     {
-        if (pt.content[index].type == 1)
+        segment *seg_data = LocateSegment(pt.content[index]);
+        if (seg_data == nullptr)
         {
-            pt.prob *= m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.letters[m.FindLetter(pt.content[index])].total_freq;
+            index += 1;
+            continue;
         }
 
-        if (pt.content[index].type == 2)
+        if (idx >= 0 && idx < (int)seg_data->ordered_freqs.size() && seg_data->total_freq > 0)
         {
-            pt.prob *= m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.digits[m.FindDigit(pt.content[index])].total_freq;
-        }
-
-        if (pt.content[index].type == 3)
-        {
-            pt.prob *= m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.symbols[m.FindSymbol(pt.content[index])].total_freq;
+            pt.prob *= seg_data->ordered_freqs[idx];
+            pt.prob /= seg_data->total_freq;
         }
 
         index += 1;
     }
 }
 
+int PriorityQueue::RandomQueueIndex()
+{
+    // 简单快速的线性同余随机数，避免频繁调用 rand() 的额外开销。
+    rng_state = rng_state * 1664525u + 1013904223u;
+    return (mq_queue_count == 0) ? 0 : (int)(rng_state % mq_queue_count);
+}
+
+float PriorityQueue::QueueTopProb(int idx) const
+{
+    if (idx < 0 || idx >= (int)local_queues.size())
+        return -1.0f;
+
+    if (local_queues[idx].empty())
+        return -1.0f;
+
+    return local_queues[idx].top().prob;
+}
+
+int PriorityQueue::ChooseBetterQueue(int i, int j) const
+{
+    float pi = QueueTopProb(i);
+    float pj = QueueTopProb(j);
+
+    if (pi < 0 && pj < 0)
+        return -1;
+    if (pi >= pj)
+        return i;
+    return j;
+}
+
+void PriorityQueue::InitMultiQueue()
+{
+    DestroyMultiQueue();
+
+    int max_threads = omp_get_max_threads();
+    if (max_threads <= 0)
+        max_threads = 1;
+
+    mq_queue_count = max(4, max_threads * MQ_FACTOR);
+
+    local_queues.clear();
+    local_queues.resize(mq_queue_count);
+
+    queue_locks.clear();
+    queue_locks.resize(mq_queue_count);
+
+    for (int i = 0; i < mq_queue_count; i++)
+    {
+        omp_init_lock(&queue_locks[i]);
+    }
+
+    locks_initialized = true;
+    use_multiqueue = true;
+    active_pt_count = 0;
+    rng_state = 1234567u;
+}
+
+void PriorityQueue::DestroyMultiQueue()
+{
+    if (locks_initialized)
+    {
+        for (int i = 0; i < (int)queue_locks.size(); i++)
+        {
+            omp_destroy_lock(&queue_locks[i]);
+        }
+    }
+
+    queue_locks.clear();
+    local_queues.clear();
+
+    locks_initialized = false;
+    use_multiqueue = false;
+    active_pt_count = 0;
+    mq_queue_count = 0;
+}
+
+void PriorityQueue::InsertPT_MQ(const PT &pt)
+{
+    if (!use_multiqueue || mq_queue_count == 0)
+    {
+        priority.emplace_back(pt);
+        return;
+    }
+
+    // MultiQueue 思路：随机找一个局部队列插入，不抢全局大队列。
+    while (true)
+    {
+        int i = RandomQueueIndex();
+
+        if (omp_test_lock(&queue_locks[i]))
+        {
+            local_queues[i].push(pt);
+            active_pt_count += 1;
+            omp_unset_lock(&queue_locks[i]);
+            return;
+        }
+    }
+}
+
+bool PriorityQueue::PopBestPTByScan(PT &pt)
+{
+    int best_idx = -1;
+    float best_prob = -1.0f;
+
+    // 作为兜底策略：随机两选一连续失败时，扫描所有局部队列。
+    // 这样可以避免队列快空时随机选不到非空队列。
+    for (int i = 0; i < mq_queue_count; i++)
+    {
+        if (omp_test_lock(&queue_locks[i]))
+        {
+            if (!local_queues[i].empty())
+            {
+                float prob = local_queues[i].top().prob;
+                if (best_idx == -1 || prob > best_prob)
+                {
+                    best_idx = i;
+                    best_prob = prob;
+                }
+            }
+            omp_unset_lock(&queue_locks[i]);
+        }
+    }
+
+    if (best_idx == -1)
+        return false;
+
+    omp_set_lock(&queue_locks[best_idx]);
+
+    if (local_queues[best_idx].empty())
+    {
+        omp_unset_lock(&queue_locks[best_idx]);
+        return false;
+    }
+
+    pt = local_queues[best_idx].top();
+    local_queues[best_idx].pop();
+    active_pt_count -= 1;
+
+    omp_unset_lock(&queue_locks[best_idx]);
+    return true;
+}
+
+bool PriorityQueue::PopPT_MQ(PT &pt)
+{
+    if (!use_multiqueue || active_pt_count == 0)
+        return false;
+
+    // MultiQueue 论文中的核心：随机选两个局部队列，取队首概率更高的那个。
+    // 这样不是严格全局最优，但比随机取一个队列更稳。
+    int max_attempts = max(16, mq_queue_count * 2);
+
+    for (int attempt = 0; attempt < max_attempts; attempt++)
+    {
+        int i = RandomQueueIndex();
+        int j = RandomQueueIndex();
+
+        int k = ChooseBetterQueue(i, j);
+        if (k < 0)
+            continue;
+
+        if (omp_test_lock(&queue_locks[k]))
+        {
+            if (!local_queues[k].empty())
+            {
+                pt = local_queues[k].top();
+                local_queues[k].pop();
+                active_pt_count -= 1;
+
+                omp_unset_lock(&queue_locks[k]);
+                return true;
+            }
+
+            omp_unset_lock(&queue_locks[k]);
+        }
+    }
+
+    return PopBestPTByScan(pt);
+}
+
+bool PriorityQueue::Empty() const
+{
+    if (use_multiqueue)
+        return active_pt_count == 0;
+
+    return priority.empty();
+}
+
 void PriorityQueue::init()
 {
+    InitMultiQueue();
+
+    priority.clear();
+
     for (PT pt : m.ordered_pts)
     {
+        pt.max_indices.clear();
+
         for (segment seg : pt.content)
         {
-            if (seg.type == 1)
+            segment *seg_data = LocateSegment(seg);
+            if (seg_data != nullptr)
             {
-                pt.max_indices.emplace_back(
-                    m.letters[m.FindLetter(seg)].ordered_values.size()
-                );
+                pt.max_indices.emplace_back((int)seg_data->ordered_values.size());
             }
-
-            if (seg.type == 2)
+            else
             {
-                pt.max_indices.emplace_back(
-                    m.digits[m.FindDigit(seg)].ordered_values.size()
-                );
-            }
-
-            if (seg.type == 3)
-            {
-                pt.max_indices.emplace_back(
-                    m.symbols[m.FindSymbol(seg)].ordered_values.size()
-                );
+                pt.max_indices.emplace_back(0);
             }
         }
 
@@ -65,20 +272,48 @@ void PriorityQueue::init()
 
         CalProb(pt);
 
-        priority.emplace_back(pt);
+        // 不再插入单一全局 priority，而是分散插入多个局部优先队列。
+        InsertPT_MQ(pt);
     }
 }
 
 void PriorityQueue::PopNext()
 {
-    Generate(priority.front());
+    PT current;
 
-    vector<PT> new_pts = priority.front().NewPTs();
+    if (use_multiqueue)
+    {
+        if (!PopPT_MQ(current))
+        {
+            return;
+        }
 
+        Generate(current);
+
+        vector<PT> new_pts = current.NewPTs();
+        for (PT pt : new_pts)
+        {
+            CalProb(pt);
+            InsertPT_MQ(pt);
+        }
+
+        return;
+    }
+
+    // 兼容旧逻辑：如果没有启用 MultiQueue，则使用原来的 priority。
+    if (priority.empty())
+        return;
+
+    current = priority.front();
+
+    Generate(current);
+
+    vector<PT> new_pts = current.NewPTs();
     for (PT pt : new_pts)
     {
         CalProb(pt);
 
+        bool inserted = false;
         for (auto iter = priority.begin(); iter != priority.end(); iter++)
         {
             if (iter != priority.end() - 1 && iter != priority.begin())
@@ -86,6 +321,7 @@ void PriorityQueue::PopNext()
                 if (pt.prob <= iter->prob && pt.prob > (iter + 1)->prob)
                 {
                     priority.emplace(iter + 1, pt);
+                    inserted = true;
                     break;
                 }
             }
@@ -93,14 +329,21 @@ void PriorityQueue::PopNext()
             if (iter == priority.end() - 1)
             {
                 priority.emplace_back(pt);
+                inserted = true;
                 break;
             }
 
             if (iter == priority.begin() && iter->prob < pt.prob)
             {
                 priority.emplace(iter, pt);
+                inserted = true;
                 break;
             }
+        }
+
+        if (!inserted)
+        {
+            priority.emplace_back(pt);
         }
     }
 
@@ -115,266 +358,92 @@ vector<PT> PT::NewPTs()
     {
         return res;
     }
-    else
+
+    int init_pivot = pivot;
+
+    for (int i = pivot; i < (int)curr_indices.size() - 1; i += 1)
     {
-        int init_pivot = pivot;
+        curr_indices[i] += 1;
 
-        for (int i = pivot; i < curr_indices.size() - 1; i += 1)
+        if (curr_indices[i] < max_indices[i])
         {
-            curr_indices[i] += 1;
-
-            if (curr_indices[i] < max_indices[i])
-            {
-                pivot = i;
-                res.emplace_back(*this);
-            }
-
-            curr_indices[i] -= 1;
+            pivot = i;
+            res.emplace_back(*this);
         }
 
-        pivot = init_pivot;
-        return res;
+        curr_indices[i] -= 1;
     }
 
+    pivot = init_pivot;
     return res;
-}
-
-// OpenMP dynamic 调度版本：
-// 小任务走串行，大任务进入 parallel for。
-// 每个线程写自己的 local vector，parallel 结束后主线程统一合并。
-static void generate_segment_openmp_dynamic(
-    vector<string>& guesses,
-    int& total_guesses,
-    segment* seg_data,
-    const string& prefix,
-    int loop_bound,
-    int thread_num,
-    int threshold,
-    int chunk_size)
-{
-    if (seg_data == nullptr)
-    {
-        return;
-    }
-
-    int actual_size = seg_data->ordered_values.size();
-
-    if (loop_bound > actual_size)
-    {
-        loop_bound = actual_size;
-    }
-
-    if (loop_bound <= 0)
-    {
-        return;
-    }
-
-    if (thread_num <= 1 || loop_bound < threshold)
-    {
-        if (prefix.empty())
-        {
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                guesses.emplace_back(seg_data->ordered_values[i]);
-            }
-        }
-        else
-        {
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                guesses.emplace_back(prefix + seg_data->ordered_values[i]);
-            }
-        }
-
-        total_guesses += loop_bound;
-        return;
-    }
-
-    if (thread_num > loop_bound)
-    {
-        thread_num = loop_bound;
-    }
-
-    if (chunk_size <= 0)
-    {
-        chunk_size = 1;
-    }
-
-    const vector<string>& values = seg_data->ordered_values;
-
-    vector<vector<string>> all_local_guesses(thread_num);
-
-#pragma omp parallel num_threads(thread_num)
-    {
-        int tid = omp_get_thread_num();
-
-        vector<string> local_guesses;
-        local_guesses.reserve(loop_bound / thread_num + chunk_size + 8);
-
-        if (prefix.empty())
-        {
-#pragma omp for schedule(dynamic, chunk_size) nowait
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                local_guesses.emplace_back(values[i]);
-            }
-        }
-        else
-        {
-#pragma omp for schedule(dynamic, chunk_size) nowait
-            for (int i = 0; i < loop_bound; i += 1)
-            {
-                local_guesses.emplace_back(prefix + values[i]);
-            }
-        }
-
-        all_local_guesses[tid].swap(local_guesses);
-    }
-
-    for (int t = 0; t < thread_num; t += 1)
-    {
-        guesses.insert(
-            guesses.end(),
-            all_local_guesses[t].begin(),
-            all_local_guesses[t].end()
-        );
-    }
-
-    total_guesses += loop_bound;
 }
 
 void PriorityQueue::Generate(PT pt)
 {
     CalProb(pt);
 
-    if (pt.content.size() == 1)
+    if (pt.content.empty())
+        return;
+
+    string prefix;
+    int last_idx = (int)pt.content.size() - 1;
+
+    // 多 segment 情况下，前面的 segment 仍然串行构造 prefix。
+    // 这部分有顺序依赖，强行并行意义不大。
+    if (pt.content.size() > 1)
     {
-        if (pt.content.empty() || pt.max_indices.empty())
+        for (int seg_idx = 0; seg_idx < last_idx; seg_idx++)
         {
-            return;
-        }
+            segment *seg_data = LocateSegment(pt.content[seg_idx]);
+            if (seg_data == nullptr)
+                continue;
 
-        segment* target_segment_data = nullptr;
-
-        if (pt.content[0].type == 1)
-        {
-            target_segment_data = &m.letters[m.FindLetter(pt.content[0])];
+            int value_idx = pt.curr_indices[seg_idx];
+            if (value_idx >= 0 && value_idx < (int)seg_data->ordered_values.size())
+            {
+                prefix += seg_data->ordered_values[value_idx];
+            }
         }
-        else if (pt.content[0].type == 2)
-        {
-            target_segment_data = &m.digits[m.FindDigit(pt.content[0])];
-        }
-        else if (pt.content[0].type == 3)
-        {
-            target_segment_data = &m.symbols[m.FindSymbol(pt.content[0])];
-        }
+    }
 
-        if (target_segment_data == nullptr)
-        {
-            return;
-        }
+    segment *last_seg_data = LocateSegment(pt.content[last_idx]);
+    if (last_seg_data == nullptr)
+        return;
 
-        int loop_bound = pt.max_indices[0];
-
-        generate_segment_openmp_dynamic(
-            guesses,
-            total_guesses,
-            target_segment_data,
-            "",
-            loop_bound,
-            omp_thread_num,
-            omp_threshold,
-            omp_chunk_size
-        );
+    int loop_bound = 0;
+    if (last_idx >= 0 && last_idx < (int)pt.max_indices.size())
+    {
+        loop_bound = min((int)last_seg_data->ordered_values.size(), pt.max_indices[last_idx]);
     }
     else
     {
-        if (pt.content.empty() ||
-            pt.curr_indices.empty() ||
-            pt.max_indices.size() != pt.content.size())
-        {
-            return;
-        }
-
-        string prefix_guess_str;
-        int seg_idx = 0;
-
-        for (int idx : pt.curr_indices)
-        {
-            if (seg_idx >= pt.content.size() - 1)
-            {
-                break;
-            }
-
-            const segment& current_seg_template = pt.content[seg_idx];
-            const segment* concrete_segment_data = nullptr;
-
-            if (current_seg_template.type == 1)
-            {
-                concrete_segment_data = &m.letters[m.FindLetter(current_seg_template)];
-            }
-            else if (current_seg_template.type == 2)
-            {
-                concrete_segment_data = &m.digits[m.FindDigit(current_seg_template)];
-            }
-            else if (current_seg_template.type == 3)
-            {
-                concrete_segment_data = &m.symbols[m.FindSymbol(current_seg_template)];
-            }
-
-            if (concrete_segment_data &&
-                idx >= 0 &&
-                idx < concrete_segment_data->ordered_values.size())
-            {
-                prefix_guess_str += concrete_segment_data->ordered_values[idx];
-            }
-            else
-            {
-                return;
-            }
-
-            seg_idx += 1;
-        }
-
-        segment* last_segment_data = nullptr;
-        int last_segment_idx = pt.content.size() - 1;
-
-        if (last_segment_idx < 0)
-        {
-            return;
-        }
-
-        const segment& last_seg_template = pt.content[last_segment_idx];
-
-        if (last_seg_template.type == 1)
-        {
-            last_segment_data = &m.letters[m.FindLetter(last_seg_template)];
-        }
-        else if (last_seg_template.type == 2)
-        {
-            last_segment_data = &m.digits[m.FindDigit(last_seg_template)];
-        }
-        else if (last_seg_template.type == 3)
-        {
-            last_segment_data = &m.symbols[m.FindSymbol(last_seg_template)];
-        }
-
-        if (last_segment_data == nullptr)
-        {
-            return;
-        }
-
-        int loop_bound = pt.max_indices[last_segment_idx];
-
-        generate_segment_openmp_dynamic(
-            guesses,
-            total_guesses,
-            last_segment_data,
-            prefix_guess_str,
-            loop_bound,
-            omp_thread_num,
-            omp_threshold,
-            omp_chunk_size
-        );
+        loop_bound = (int)last_seg_data->ordered_values.size();
     }
+
+    if (loop_bound <= 0)
+        return;
+
+    // 候选编号直写：提前扩容，然后每个线程写自己的 guesses[base+i]。
+    // 这样避免了 local vector 再 insert 合并，也避免了 critical。
+    size_t base = guesses.size();
+    guesses.resize(base + loop_bound);
+
+    if (prefix.empty())
+    {
+#pragma omp parallel for schedule(static) if(loop_bound >= MIN_OPENMP_GRAIN)
+        for (int i = 0; i < loop_bound; i++)
+        {
+            guesses[base + i] = last_seg_data->ordered_values[i];
+        }
+    }
+    else
+    {
+#pragma omp parallel for schedule(static) if(loop_bound >= MIN_OPENMP_GRAIN)
+        for (int i = 0; i < loop_bound; i++)
+        {
+            guesses[base + i] = prefix + last_seg_data->ordered_values[i];
+        }
+    }
+
+    total_guesses = (int)guesses.size();
 }
