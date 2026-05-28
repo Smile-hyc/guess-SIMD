@@ -63,44 +63,117 @@ void PriorityQueue::init()
     }
 }
 
-void PriorityQueue::PopNext()
+void PriorityQueue::InsertNewPTs(const vector<PT> &new_pts)
 {
-    // 和学长基础版本保持一致：
-    // PopNext 不再调用串行 Generate，而是调用 GenerateMPI。
-    GenerateMPI(priority.front());
-
-    vector<PT> new_pts = priority.front().NewPTs();
-
     for (PT pt : new_pts)
     {
-        CalProb(pt);
+        if (priority.empty())
+        {
+            priority.emplace_back(pt);
+            continue;
+        }
+
+        bool inserted = false;
 
         for (auto iter = priority.begin(); iter != priority.end(); iter++)
         {
-            if (iter != priority.end() - 1 && iter != priority.begin())
+            if (iter == priority.begin() && iter->prob < pt.prob)
             {
-                if (pt.prob <= iter->prob && pt.prob > (iter + 1)->prob)
-                {
-                    priority.emplace(iter + 1, pt);
-                    break;
-                }
+                priority.emplace(iter, pt);
+                inserted = true;
+                break;
+            }
+
+            if (iter != priority.end() - 1 && pt.prob <= iter->prob && pt.prob > (iter + 1)->prob)
+            {
+                priority.emplace(iter + 1, pt);
+                inserted = true;
+                break;
             }
 
             if (iter == priority.end() - 1)
             {
                 priority.emplace_back(pt);
-                break;
-            }
-
-            if (iter == priority.begin() && iter->prob < pt.prob)
-            {
-                priority.emplace(iter, pt);
+                inserted = true;
                 break;
             }
         }
+
+        if (!inserted)
+        {
+            priority.emplace_back(pt);
+        }
+    }
+}
+
+void PriorityQueue::PopNext()
+{
+    GenerateMPI(priority.front());
+
+    vector<PT> new_pts = priority.front().NewPTs();
+
+    for (PT &pt : new_pts)
+    {
+        CalProb(pt);
     }
 
+    InsertNewPTs(new_pts);
+
     priority.erase(priority.begin());
+}
+
+void PriorityQueue::PopNextBatch(int batch_size)
+{
+    if (priority.empty())
+    {
+        return;
+    }
+
+    int actual_batch_size = min(batch_size, (int)priority.size());
+
+    // 先把本轮要处理的 PT 拷贝出来。
+    // 所有进程的 priority 初始一致，所以这里拷出来的 batch_pts 也一致。
+    vector<PT> batch_pts;
+    batch_pts.reserve(actual_batch_size);
+
+    for (int i = 0; i < actual_batch_size; i++)
+    {
+        batch_pts.emplace_back(priority[i]);
+    }
+
+    // PT 层面并行：
+    // rank 0 处理 batch_pts[0]，rank 1 处理 batch_pts[1] ...
+    // 如果 batch_size 大于 mpi_size，则按 i % mpi_size 继续分配。
+    for (int i = 0; i < actual_batch_size; i++)
+    {
+        if (i % mpi_size == mpi_rank)
+        {
+            // 这里用 Generate，而不是 GenerateMPI。
+            // 因为这个 PT 已经分给当前进程了，当前进程要生成这个 PT 的完整候选集合。
+            Generate(batch_pts[i]);
+        }
+    }
+
+    // 所有进程都用同样的 batch_pts 计算新 PT。
+    // 这样可以避免复杂的 PT 序列化和广播，同时保证各进程队列状态一致。
+    vector<PT> all_new_pts;
+
+    for (int i = 0; i < actual_batch_size; i++)
+    {
+        vector<PT> new_pts = batch_pts[i].NewPTs();
+
+        for (PT &pt : new_pts)
+        {
+            CalProb(pt);
+            all_new_pts.emplace_back(pt);
+        }
+    }
+
+    // 删除本轮已经处理的一批 PT
+    priority.erase(priority.begin(), priority.begin() + actual_batch_size);
+
+    // 按同样顺序插回所有新 PT
+    InsertNewPTs(all_new_pts);
 }
 
 vector<PT> PT::NewPTs()
@@ -115,7 +188,7 @@ vector<PT> PT::NewPTs()
     {
         int init_pivot = pivot;
 
-        for (int i = pivot; i < curr_indices.size() - 1; i += 1)
+        for (int i = pivot; i < (int)curr_indices.size() - 1; i += 1)
         {
             curr_indices[i] += 1;
 
@@ -189,30 +262,31 @@ void PriorityQueue::Generate(PT pt)
 
             seg_idx += 1;
 
-            if (seg_idx == pt.content.size() - 1)
+            if (seg_idx == (int)pt.content.size() - 1)
             {
                 break;
             }
         }
 
         segment *a = nullptr;
+        int last_idx = pt.content.size() - 1;
 
-        if (pt.content[pt.content.size() - 1].type == 1)
+        if (pt.content[last_idx].type == 1)
         {
-            a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
+            a = &m.letters[m.FindLetter(pt.content[last_idx])];
         }
 
-        if (pt.content[pt.content.size() - 1].type == 2)
+        if (pt.content[last_idx].type == 2)
         {
-            a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
+            a = &m.digits[m.FindDigit(pt.content[last_idx])];
         }
 
-        if (pt.content[pt.content.size() - 1].type == 3)
+        if (pt.content[last_idx].type == 3)
         {
-            a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
+            a = &m.symbols[m.FindSymbol(pt.content[last_idx])];
         }
 
-        for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
+        for (int i = 0; i < pt.max_indices[last_idx]; i += 1)
         {
             string temp = guess + a->ordered_values[i];
             guesses.emplace_back(temp);
@@ -224,6 +298,12 @@ void PriorityQueue::Generate(PT pt)
 void PriorityQueue::GenerateMPI(PT pt)
 {
     CalProb(pt);
+
+    if (mpi_size <= 1)
+    {
+        Generate(pt);
+        return;
+    }
 
     if (pt.content.size() == 1)
     {
@@ -283,30 +363,31 @@ void PriorityQueue::GenerateMPI(PT pt)
 
             seg_idx += 1;
 
-            if (seg_idx == pt.content.size() - 1)
+            if (seg_idx == (int)pt.content.size() - 1)
             {
                 break;
             }
         }
 
         segment *a = nullptr;
+        int last_idx = pt.content.size() - 1;
 
-        if (pt.content[pt.content.size() - 1].type == 1)
+        if (pt.content[last_idx].type == 1)
         {
-            a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
+            a = &m.letters[m.FindLetter(pt.content[last_idx])];
         }
 
-        if (pt.content[pt.content.size() - 1].type == 2)
+        if (pt.content[last_idx].type == 2)
         {
-            a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
+            a = &m.digits[m.FindDigit(pt.content[last_idx])];
         }
 
-        if (pt.content[pt.content.size() - 1].type == 3)
+        if (pt.content[last_idx].type == 3)
         {
-            a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
+            a = &m.symbols[m.FindSymbol(pt.content[last_idx])];
         }
 
-        int total_values = pt.max_indices[pt.content.size() - 1];
+        int total_values = pt.max_indices[last_idx];
 
         int values_per_process = total_values / mpi_size;
         int remainder = total_values % mpi_size;

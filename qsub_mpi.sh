@@ -2,7 +2,7 @@
 #PBS -N qsub_mpi
 #PBS -e test.e
 #PBS -o test.o
-#PBS -l nodes=2:ppn=8
+#PBS -l nodes=1:ppn=8
 
 NODES=$(cat $PBS_NODEFILE | sort | uniq)
 
@@ -11,6 +11,6 @@ for node in $NODES; do
     scp -r master_ubss1:/home/${USER}/guess/files ${node}:/home/${USER}/ 1>&2
 done
 
-/usr/local/bin/mpiexec -np 8 -machinefile $PBS_NODEFILE /home/${USER}/main
+/usr/local/bin/mpiexec -np 4 -machinefile $PBS_NODEFILE /home/${USER}/main
 
 scp -r /home/${USER}/files/ master_ubss1:/home/${USER}/guess/ 2>&1
