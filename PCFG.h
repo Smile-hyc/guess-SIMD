@@ -120,21 +120,26 @@ public:
     model m;
 
     void CalProb(PT &pt);
-
     void init();
 
     // MPI 进程信息
     int mpi_rank = 0;
     int mpi_size = 1;
 
-    // MPI 版本 Generate：每个进程只生成自己负责的 ordered_values 区间
+    // 基础 MPI 版本：单个 PT 内部按 rank 分片
     void GenerateMPI(PT pt);
 
-    // 原始串行 Generate 保留，方便对照
+    // 串行生成：用于 PT 层面并行时，某个 rank 处理完整 PT
     void Generate(PT pt);
 
-    // 这里会改成调用 GenerateMPI
+    // 基础 MPI 版本：每次处理一个 PT
     void PopNext();
+
+    // PT 层面并行版本：一次取出多个 PT
+    void PopNextBatch(int batch_size = 4);
+
+    // 将新 PT 按概率插回优先队列
+    void InsertNewPTs(const vector<PT> &new_pts);
 
     int total_guesses = 0;
     vector<string> guesses;
